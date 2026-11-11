@@ -1,0 +1,12 @@
+{{ heading }}
+{{ date|date:"N j, Y" }} - {{ total }} item{{ total|pluralize }}
+{% for n in notifications %}
+- {{ n.title }}{% if n.body %}: {{ n.body|truncatewords:20 }}{% endif %} ({{ n.created_at|timesince }} ago)
+{% endfor %}{% if overflow %}
+...and {{ overflow }} more.
+{% endif %}
+View all: {{ app_url }}/notifications/
+
+---
+You received this because of your notification settings.
+Manage preferences: {{ app_url }}/notifications/preferences/

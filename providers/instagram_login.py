@@ -1,0 +1,769 @@
+"""Instagram API with Instagram Login provider.
+
+Supports Professional Instagram accounts (Business or Creator) via the
+Instagram Login OAuth flow — distinct from the Facebook-Login path used by
+``InstagramProvider``. No linked Facebook Page is required.
+
+Personal (non-Professional) Instagram accounts have no API access since
+the Basic Display API was retired on 2024-12-04. Users must convert their
+account to Professional before connecting.
+
+Docs: https://developers.facebook.com/docs/instagram-platform/instagram-api-with-instagram-login
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from datetime import datetime
+from urllib.parse import urlencode
+
+from .base import SocialProvider
+from .exceptions import APIError, OAuthError, ProviderError, PublishError
+from .qpost import (
+    get_qpost_account_metrics,
+    get_qpost_post_metrics,
+    get_qpost_profile,
+    is_qpost_enabled,
+    publish_via_qpost,
+    resolve_qpost_api_key,
+)
+from .meta_comments import (
+    fetch_instagram_comments,
+    find_own_instagram_comment,
+    resolve_comment_reply_target,
+)
+from .meta_insights import fetch_insights_safe
+from .meta_messaging import (
+    build_send_payload,
+    dm_extra,
+    require_message_id,
+    resolve_recipient_id,
+    validate_instagram_text,
+)
+from .types import (
+    AccountMetrics,
+    AccountProfile,
+    AuthType,
+    CommentResult,
+    InboxMessage,
+    MediaType,
+    OAuthTokens,
+    PostMetrics,
+    PostType,
+    PublishContent,
+    PublishResult,
+    RateLimitConfig,
+    ReplyResult,
+)
+
+logger = logging.getLogger(__name__)
+
+AUTH_URL = "https://www.instagram.com/oauth/authorize"
+TOKEN_URL = "https://api.instagram.com/oauth/access_token"
+GRAPH_HOST = "https://graph.instagram.com"
+API_BASE = f"{GRAPH_HOST}/v25.0"
+# Subscribed on the Instagram account itself — this flow has no Facebook Page.
+INSTAGRAM_LOGIN_WEBHOOK_FIELDS = ["comments", "messages"]
+INSTAGRAM_ACCOUNT_INSIGHTS = [
+    "reach",
+    "views",
+    "accounts_engaged",
+    "total_interactions",
+]
+INSTAGRAM_MEDIA_INSIGHTS = [
+    "reach",
+    "views",
+    "likes",
+    "comments",
+    "saved",
+    "shares",
+    "total_interactions",
+]
+INSTAGRAM_MEDIA_FIELDS = [
+    "id",
+    "caption",
+    "media_type",
+    "media_product_type",
+    "media_url",
+    "thumbnail_url",
+    "permalink",
+    "timestamp",
+    "like_count",
+    "comments_count",
+]
+
+# Container polling
+CONTAINER_POLL_INTERVAL = 2  # seconds
+CONTAINER_POLL_TIMEOUT = 120  # seconds
+
+
+class InstagramLoginProvider(SocialProvider):
+    """Instagram API provider using Instagram Login (OAuth 2.0).
+
+    Authenticates Professional (Business or Creator) Instagram accounts
+    directly through Instagram, without requiring a linked Facebook Page.
+    """
+
+    # Publishes from hosted URLs only — the platform fetches the media
+    # itself, so ``PublishContent.media_files`` is never read and the engine
+    # can skip downloading the asset to local disk entirely.
+    @property
+    def needs_local_media(self) -> bool:
+        return is_qpost_enabled("instagram_login", self.credentials)
+
+    def __init__(self, credentials: dict | None = None):
+        creds = dict(credentials or {})
+        # Normalize: accept app_id/app_secret as aliases for client_id/client_secret
+        if "app_id" in creds and "client_id" not in creds:
+            creds["client_id"] = creds.pop("app_id")
+        if "app_secret" in creds and "client_secret" not in creds:
+            creds["client_secret"] = creds.pop("app_secret")
+        super().__init__(creds)
+
+    # ------------------------------------------------------------------
+    # Metadata
+    # ------------------------------------------------------------------
+
+    @property
+    def platform_name(self) -> str:
+        return "Instagram (Direct)"
+
+    @property
+    def auth_type(self) -> AuthType:
+        return AuthType.OAUTH2
+
+    @property
+    def max_caption_length(self) -> int:
+        return 2200
+
+    @property
+    def supported_post_types(self) -> list[PostType]:
+        # VIDEO is accepted (and published as a Reel) even though Instagram has
+        # no standalone feed video, because an explicit post_type hint can still
+        # deliver it.
+        return [PostType.IMAGE, PostType.VIDEO, PostType.CAROUSEL, PostType.REEL, PostType.STORY]
+
+    @property
+    def supported_media_types(self) -> list[MediaType]:
+        return [MediaType.JPEG, MediaType.PNG, MediaType.GIF, MediaType.MP4, MediaType.MOV]
+
+    @property
+    def required_scopes(self) -> list[str]:
+        return [
+            "instagram_business_basic",
+            "instagram_business_content_publish",
+            "instagram_business_manage_comments",
+            "instagram_business_manage_messages",
+            # Required for the `/insights` endpoints, and requested
+            # unconditionally rather than through ``analytics_only_scopes``.
+            # An OAuth grant is frozen at connect time while the
+            # AnalyticsPlatformConfig toggle it was gated on can flip
+            # afterwards, so gating it minted tokens that could never read
+            # insights once analytics was switched on — the account had to be
+            # reconnected, with nothing but an empty page to say so. Mirrors
+            # providers/instagram.py, which has always asked for
+            # instagram_manage_insights on the Facebook-Page path.
+            "instagram_business_manage_insights",
+        ]
+
+    @property
+    def rate_limits(self) -> RateLimitConfig:
+        return RateLimitConfig(
+            requests_per_hour=200,
+            requests_per_day=5000,
+            publish_per_day=100,
+        )
+
+    # ------------------------------------------------------------------
+    # OAuth
+    # ------------------------------------------------------------------
+
+    def get_auth_url(self, redirect_uri: str, state: str, code_verifier: str | None = None) -> str:
+        params = {
+            "client_id": self.credentials["client_id"],
+            "redirect_uri": redirect_uri,
+            "state": state,
+            "scope": ",".join(self.required_scopes),
+            "response_type": "code",
+            "enable_fb_login": "0",
+            "force_authentication": "1",
+        }
+        return f"{AUTH_URL}?{urlencode(params)}"
+
+    def exchange_code(self, code: str, redirect_uri: str, code_verifier: str | None = None) -> OAuthTokens:
+        # Instagram Login requires multipart/form-data, not urlencoded.
+        fields = {
+            "client_id": self.credentials["client_id"],
+            "client_secret": self.credentials["client_secret"],
+            "code": code,
+            "grant_type": "authorization_code",
+            "redirect_uri": redirect_uri,
+        }
+        resp = self._request(
+            "POST",
+            TOKEN_URL,
+            files={k: (None, v) for k, v in fields.items()},
+        )
+        body = resp.json()
+        short_lived_token = body.get("access_token")
+        logger.info(
+            "IG-Login step 1: status=%s keys=%s user_id=%s token=%s len=%d",
+            resp.status_code,
+            sorted(body.keys()),
+            body.get("user_id"),
+            (short_lived_token[:6] + "...") if short_lived_token else None,
+            len(short_lived_token) if short_lived_token else 0,
+        )
+        if not short_lived_token:
+            raise OAuthError(
+                f"Instagram token exchange failed: {body}",
+                platform=self.platform_name,
+                raw_response=body,
+            )
+
+        # Exchange short-lived token (~1 hour) for long-lived token (~60 days)
+        return self._exchange_for_long_lived_token(short_lived_token)
+
+    def _exchange_for_long_lived_token(self, short_lived_token: str) -> OAuthTokens:
+        url = f"{GRAPH_HOST}/access_token"
+        logger.info(
+            "IG-Login step 2: GET %s client_id=%s token=%s",
+            url,
+            self.credentials.get("client_id"),
+            short_lived_token[:6] + "...",
+        )
+        resp = self._request(
+            "GET",
+            url,
+            params={
+                "grant_type": "ig_exchange_token",
+                "client_id": self.credentials["client_id"],
+                "client_secret": self.credentials["client_secret"],
+                "access_token": short_lived_token,
+            },
+        )
+        body = resp.json()
+        if "access_token" not in body:
+            raise OAuthError(
+                f"Instagram long-lived token exchange failed: {body}",
+                platform=self.platform_name,
+                raw_response=body,
+            )
+        token = body["access_token"]
+        return OAuthTokens(
+            access_token=token,
+            # Instagram Login uses the access token itself for refresh
+            refresh_token=token,
+            expires_in=body.get("expires_in"),
+            token_type=body.get("token_type", "Bearer"),
+            raw_response=body,
+        )
+
+    def refresh_token(self, refresh_token: str) -> OAuthTokens:
+        """Refresh a long-lived Instagram token.
+
+        Instagram Login uses the access token itself for refresh - there is
+        no separate refresh token.
+        """
+        resp = self._request(
+            "GET",
+            f"{GRAPH_HOST}/refresh_access_token",
+            params={
+                "grant_type": "ig_refresh_token",
+                "access_token": refresh_token,
+            },
+        )
+        body = resp.json()
+        if "access_token" not in body:
+            raise OAuthError(
+                f"Instagram token refresh failed: {body}",
+                platform=self.platform_name,
+                raw_response=body,
+            )
+        token = body["access_token"]
+        return OAuthTokens(
+            access_token=token,
+            refresh_token=token,
+            expires_in=body.get("expires_in"),
+            token_type=body.get("token_type", "Bearer"),
+            raw_response=body,
+        )
+
+    # ------------------------------------------------------------------
+    # Profile
+    # ------------------------------------------------------------------
+
+    def get_profile(self, access_token: str) -> AccountProfile:
+        if is_qpost_enabled("instagram_login", self.credentials, access_token):
+            return get_qpost_profile("instagram_login", resolve_qpost_api_key(access_token, self.credentials))
+        resp = self._request(
+            "GET",
+            f"{API_BASE}/me",
+            access_token=access_token,
+            params={
+                "fields": "user_id,username,name,profile_picture_url,followers_count,media_count,biography",
+            },
+        )
+        data = resp.json()
+        return AccountProfile(
+            platform_id=str(data.get("user_id", data.get("id", ""))),
+            name=data.get("name", data.get("username", "")),
+            handle=data.get("username"),
+            avatar_url=data.get("profile_picture_url"),
+            follower_count=data.get("followers_count", 0),
+            extra=data,
+        )
+
+    # ------------------------------------------------------------------
+    # Publishing
+    # ------------------------------------------------------------------
+
+    def publish_post(self, access_token: str, content: PublishContent) -> PublishResult:
+        if is_qpost_enabled("instagram_login", self.credentials, access_token):
+            return publish_via_qpost(
+                "instagram_login",
+                resolve_qpost_api_key(access_token, self.credentials),
+                content,
+                platform_label=self.platform_name,
+            )
+        if not content.media_urls:
+            raise PublishError(
+                "Instagram requires at least one media item",
+                platform=self.platform_name,
+                retryable=False,
+            )
+
+        if content.post_type == PostType.CAROUSEL and len(content.media_urls) > 1:
+            return self._publish_carousel(access_token, content)
+        return self._publish_single(access_token, content)
+
+    def _publish_single(self, access_token: str, content: PublishContent) -> PublishResult:
+        payload: dict = {}
+        if content.text:
+            payload["caption"] = content.text
+
+        # Route on what the asset *is*, not only on which post types name a
+        # video: any post type carrying a video has to reach a video field, or
+        # the .mp4 goes out as image_url and Instagram rejects it with "The
+        # image format is not supported" (36001).
+        url = content.media_urls[0]
+        is_video = content.is_video(0)
+
+        if content.post_type == PostType.STORY:
+            payload["media_type"] = "STORIES"
+            payload["video_url" if is_video else "image_url"] = url
+        elif is_video or content.post_type in (PostType.REEL, PostType.VIDEO):
+            # Instagram has no standalone feed video: a single video is
+            # published as a Reel. This also catches a lone video that arrived
+            # under some other post type — PostType.VIDEO (the engine's
+            # fallback for one video asset) or a CAROUSEL that ended up with a
+            # single item.
+            payload["media_type"] = "REELS"
+            payload["video_url"] = url
+        else:
+            payload["image_url"] = url
+
+        container_id = self._create_container(access_token, payload)
+        self._wait_for_container(access_token, container_id)
+        return self._publish_container(access_token, container_id)
+
+    def _publish_carousel(self, access_token: str, content: PublishContent) -> PublishResult:
+        child_ids: list[str] = []
+
+        for index, url in enumerate(content.media_urls):
+            child_payload: dict = {"is_carousel_item": True}
+            if content.is_video(index):
+                child_payload["media_type"] = "VIDEO"
+                child_payload["video_url"] = url
+            else:
+                child_payload["image_url"] = url
+
+            child_id = self._create_container(access_token, child_payload)
+            self._wait_for_container(access_token, child_id)
+            child_ids.append(child_id)
+
+        carousel_payload: dict = {
+            "media_type": "CAROUSEL",
+            "children": ",".join(child_ids),
+        }
+        if content.text:
+            carousel_payload["caption"] = content.text
+
+        carousel_id = self._create_container(access_token, carousel_payload)
+        self._wait_for_container(access_token, carousel_id)
+        return self._publish_container(access_token, carousel_id)
+
+    def _create_container(self, access_token: str, payload: dict) -> str:
+        resp = self._request(
+            "POST",
+            f"{API_BASE}/me/media",
+            access_token=access_token,
+            json=payload,
+        )
+        data = resp.json()
+        container_id = data.get("id")
+        if not container_id:
+            raise PublishError(
+                "Failed to create Instagram media container",
+                platform=self.platform_name,
+                raw_response=data,
+            )
+        return container_id
+
+    def _wait_for_container(self, access_token: str, container_id: str) -> None:
+        """Poll container status until FINISHED or error."""
+
+        def finished() -> bool:
+            resp = self._request(
+                "GET",
+                f"{API_BASE}/{container_id}",
+                access_token=access_token,
+                params={"fields": "status_code,status"},
+            )
+            data = resp.json()
+            status = data.get("status_code", "")
+            if status == "ERROR":
+                raise PublishError(
+                    f"Instagram container failed: {data.get('status', 'unknown error')}",
+                    platform=self.platform_name,
+                    raw_response=data,
+                )
+            return status == "FINISHED"
+
+        self._poll_until(
+            finished,
+            deadline=time.monotonic() + CONTAINER_POLL_TIMEOUT,
+            interval=CONTAINER_POLL_INTERVAL,
+            on_timeout=lambda: PublishError("Instagram container processing timed out", platform=self.platform_name),
+        )
+
+    def _publish_container(self, access_token: str, container_id: str) -> PublishResult:
+        resp = self._request(
+            "POST",
+            f"{API_BASE}/me/media_publish",
+            access_token=access_token,
+            json={"creation_id": container_id},
+        )
+        data = resp.json()
+        media_id = data.get("id", "")
+        return PublishResult(
+            platform_post_id=media_id,
+            url=f"https://www.instagram.com/p/{media_id}/",
+            extra=data,
+        )
+
+    # ------------------------------------------------------------------
+    # Comments
+    # ------------------------------------------------------------------
+
+    def publish_comment(self, access_token: str, post_id: str, text: str) -> CommentResult:
+        # No ``fields`` param — see InstagramProvider.publish_comment: Meta
+        # creates the comment and *then* rejects the response format, so the
+        # retry queue duplicates it.
+        resp = self._request(
+            "POST",
+            f"{API_BASE}/{post_id}/comments",
+            access_token=access_token,
+            json={"message": text},
+        )
+        data = resp.json()
+        return CommentResult(platform_comment_id=data["id"], extra=data)
+
+    def find_own_comment(self, access_token: str, post_id: str, text: str) -> str | None:
+        """Find a comment this account already left on ``post_id``.
+
+        Reconciliation before retrying a first comment — see
+        ``InstagramProvider.find_own_comment``.
+        """
+        return find_own_instagram_comment(
+            self._request,
+            api_base=API_BASE,
+            access_token=access_token,
+            media_id=post_id,
+            text=text,
+            own_id=str(self.credentials.get("ig_user_id") or ""),
+            own_handle=str(self.credentials.get("account_handle") or ""),
+        )
+
+    # ------------------------------------------------------------------
+    # Analytics
+    # ------------------------------------------------------------------
+
+    def get_post_metrics(self, access_token: str, post_id: str) -> PostMetrics:
+        if is_qpost_enabled("instagram_login", self.credentials, access_token):
+            return get_qpost_post_metrics(
+                "instagram_login",
+                resolve_qpost_api_key(access_token, self.credentials),
+                post_id,
+                platform_label=self.platform_name,
+            )
+        fields = self._get_media_fields(access_token, post_id)
+        values, errors = fetch_insights_safe(
+            self._request,
+            platform=self.platform_name,
+            endpoint=f"{API_BASE}/{post_id}/insights",
+            access_token=access_token,
+            metrics=INSTAGRAM_MEDIA_INSIGHTS,
+            endpoint_type="media",
+        )
+        likes = values.get("likes", fields.get("like_count", 0))
+        comments = values.get("comments", fields.get("comments_count", 0))
+
+        return PostMetrics(
+            reach=values.get("reach", 0),
+            likes=likes,
+            comments=comments,
+            saves=values.get("saved", 0),
+            shares=values.get("shares", 0),
+            video_views=values.get("views", 0),
+            extra={
+                "total_interactions": values.get("total_interactions", 0),
+                "raw_fields": fields,
+                "raw_insights": values,
+                "insight_errors": errors,
+            },
+        )
+
+    def get_account_metrics(self, access_token: str, date_range: tuple[datetime, datetime]) -> AccountMetrics:
+        if is_qpost_enabled("instagram_login", self.credentials, access_token):
+            return get_qpost_account_metrics("instagram_login", resolve_qpost_api_key(access_token, self.credentials))
+        since = int(date_range[0].timestamp())
+        until = int(date_range[1].timestamp())
+        values, errors = fetch_insights_safe(
+            self._request,
+            platform=self.platform_name,
+            endpoint=f"{API_BASE}/me/insights",
+            access_token=access_token,
+            metrics=INSTAGRAM_ACCOUNT_INSIGHTS,
+            base_params={
+                "period": "day",
+                "since": since,
+                "until": until,
+            },
+            metric_params={
+                "views": {"metric_type": "total_value"},
+                "accounts_engaged": {"metric_type": "total_value"},
+                "total_interactions": {"metric_type": "total_value"},
+            },
+            endpoint_type="account",
+        )
+        profile = self._get_profile_fields(access_token)
+        # ``None`` means the fetch FAILED (vs a real 0): leave followers unset so
+        # _account_metrics_to_dict skips it and we don't poison the snapshot with 0.
+        followers = profile.get("followers_count", 0) if profile is not None else None
+
+        return AccountMetrics(
+            reach=values.get("reach", 0),
+            followers=followers,
+            extra={
+                "views": values.get("views", 0),
+                "accounts_engaged": values.get("accounts_engaged", 0),
+                "total_interactions": values.get("total_interactions", 0),
+                "raw_insights": values,
+                "insight_errors": errors,
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # Inbox
+    # ------------------------------------------------------------------
+
+    def get_messages(self, access_token: str, since: datetime | None = None) -> list[InboxMessage]:
+        if is_qpost_enabled("instagram_login", self.credentials, access_token):
+            return []
+        messages: list[InboxMessage] = []
+        failures: list[Exception] = []
+
+        for label, fetch in (("DM", self._fetch_direct_messages), ("comment", self._fetch_media_comments)):
+            try:
+                messages.extend(fetch(access_token, since))
+            except Exception as exc:
+                failures.append(exc)
+                logger.warning("Instagram Login %s poll failed: error_type=%s", label, type(exc).__name__)
+
+        if failures and not messages:
+            raise failures[0]
+        return messages
+
+    def _fetch_media_comments(self, access_token: str, since: datetime | None = None) -> list[InboxMessage]:
+        """Poll comments on the account's recent media.
+
+        The ``comments`` webhook is the fast path, but an account whose
+        subscription never took would otherwise never see a comment and have no
+        way to backfill.
+        """
+        return fetch_instagram_comments(
+            self._request,
+            platform=self.platform_name,
+            host=API_BASE,
+            media_url=f"{API_BASE}/me/media",
+            access_token=access_token,
+            since=since,
+            owner_id=str(self.credentials.get("ig_user_id") or ""),
+            owner_handle=str(self.credentials.get("account_handle") or ""),
+        )
+
+    def _fetch_direct_messages(self, access_token: str, since: datetime | None = None) -> list[InboxMessage]:
+        params: dict = {"fields": "id,participants,messages{id,message,from,created_time,attachments}"}
+        if since:
+            params["since"] = int(since.timestamp())
+
+        resp = self._request(
+            "GET",
+            f"{API_BASE}/me/conversations",
+            access_token=access_token,
+            params=params,
+        )
+        conversations = resp.json().get("data", [])
+
+        own_id = str(self.credentials.get("ig_user_id", ""))
+
+        messages: list[InboxMessage] = []
+        for convo in conversations:
+            for msg in convo.get("messages", {}).get("data", []):
+                sender = msg.get("from", {})
+                sender_id = str(sender.get("id", ""))
+                # A conversation contains both sides. Without this the account's
+                # own replies come back on the next poll as fresh inbound DMs,
+                # re-notifying the team and restarting their SLA clock.
+                if own_id and sender_id == own_id:
+                    continue
+                messages.append(
+                    InboxMessage(
+                        platform_message_id=msg["id"],
+                        sender_id=sender_id,
+                        sender_name=sender.get("name", sender.get("username", "")),
+                        text=msg.get("message", ""),
+                        timestamp=datetime.fromisoformat(msg["created_time"].replace("+0000", "+00:00")),
+                        message_type="dm",
+                        # sender_id is the IGSID the messaging endpoint replies to.
+                        extra=dm_extra(msg, sender_id=sender_id, conversation_id=convo["id"]),
+                    )
+                )
+        return messages
+
+    def reply_to_message(
+        self,
+        access_token: str,
+        message_id: str,
+        text: str,
+        extra: dict | None = None,
+        *,
+        human_agent: bool = False,
+    ) -> ReplyResult:
+        """Send a DM reply addressed to the sender's IGSID."""
+        igsid = resolve_recipient_id(extra)
+        if not igsid:
+            raise APIError(
+                "Cannot send the reply: no Instagram-scoped ID for the recipient. "
+                "The original message is missing its sender details.",
+                platform=self.platform_name,
+            )
+
+        validate_instagram_text(text, platform=self.platform_name)
+        payload = build_send_payload(igsid, text, human_agent=human_agent)
+
+        resp = self._request(
+            "POST",
+            f"{API_BASE}/me/messages",
+            access_token=access_token,
+            json=payload,
+        )
+        data = resp.json()
+        return ReplyResult(platform_message_id=require_message_id(data, platform=self.platform_name), extra=data)
+
+    def reply_to_comment(self, access_token: str, comment_id: str, text: str, extra: dict | None = None) -> ReplyResult:
+        """Reply to a comment, or comment on a media item.
+
+        A comment is answered on its ``replies`` edge, but a mention in a
+        caption gives us only the media ID, which has no ``replies`` edge —
+        that one is answered by commenting on the media itself. The inbox
+        records which applies as ``reply_edge``.
+        """
+        target, edge = resolve_comment_reply_target(comment_id, extra)
+        resp = self._request(
+            "POST",
+            f"{API_BASE}/{target}/{edge}",
+            access_token=access_token,
+            json={"message": text},
+        )
+        data = resp.json()
+        return ReplyResult(platform_message_id=data.get("id", ""), extra=data)
+
+    # ------------------------------------------------------------------
+    # Webhooks
+    # ------------------------------------------------------------------
+
+    def subscribe_webhooks(self, access_token: str, account_id: str) -> bool:
+        if is_qpost_enabled("instagram_login", self.credentials, access_token):
+            return True
+        resp = self._request(
+            "POST",
+            f"{API_BASE}/me/subscribed_apps",
+            access_token=access_token,
+            params={"subscribed_fields": ",".join(INSTAGRAM_LOGIN_WEBHOOK_FIELDS)},
+        )
+        return bool(resp.json().get("success"))
+
+    def unsubscribe_webhooks(self, access_token: str, account_id: str) -> bool:
+        if is_qpost_enabled("instagram_login", self.credentials, access_token):
+            return True
+        resp = self._request(
+            "DELETE",
+            f"{API_BASE}/me/subscribed_apps",
+            access_token=access_token,
+        )
+        return bool(resp.json().get("success"))
+
+    def _get_profile_fields(self, access_token: str) -> dict | None:
+        # Returns ``None`` on failure so callers can distinguish a failed fetch
+        # from a successful one with no data (a genuine 0).
+        try:
+            return self._request(
+                "GET",
+                f"{API_BASE}/me",
+                access_token=access_token,
+                params={"fields": "user_id,username,name,profile_picture_url,followers_count,media_count"},
+            ).json()
+        except APIError as exc:
+            logger.debug("Instagram Login profile fields unavailable: %s", exc)
+            return None
+
+    def _get_media_fields(self, access_token: str, media_id: str) -> dict:
+        try:
+            return self._request(
+                "GET",
+                f"{API_BASE}/{media_id}",
+                access_token=access_token,
+                params={"fields": ",".join(INSTAGRAM_MEDIA_FIELDS)},
+            ).json()
+        except APIError as exc:
+            logger.debug("Instagram Login media fields unavailable for %s: %s", media_id, exc)
+            return {}
+
+    # ------------------------------------------------------------------
+    # Token management
+    # ------------------------------------------------------------------
+
+    def revoke_token(self, access_token: str) -> bool:
+        """Revoke this app's grant on the connected Instagram account.
+
+        Safe to do per-account here, unlike the Facebook-Page providers: this
+        flow's token belongs to the Instagram account itself, so revoking it
+        severs nothing else. It also restores the full permission dialog on the
+        next connect, rather than the abbreviated "continue sharing?" prompt.
+        """
+        try:
+            self._request(
+                "DELETE",
+                f"{API_BASE}/me/permissions",
+                access_token=access_token,
+            )
+            return True
+        except ProviderError:
+            # Not just APIError: a 429 raises RateLimitError and an expired
+            # grant raises TokenExpiredError, neither of which subclasses it.
+            # Disconnect must proceed regardless of why revocation failed.
+            logger.warning("Failed to revoke Instagram token")
+            return False

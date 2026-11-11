@@ -1,0 +1,201 @@
+{% comment %}
+Single connected account card - HTMX-swappable.
+Usage: {% include "social_accounts/partials/_account_card.html" with account=account workspace_id=workspace_id %}
+{% endcomment %}
+{% load social_accounts_tags %}
+<div id="account-{{ account.id }}" class="group relative bg-white rounded-xl border border-stone-200 p-5 transition-all duration-200 hover:shadow">
+    <div class="flex items-start gap-4">
+        <!-- Avatar -->
+        <div class="flex-shrink-0">
+            {% if account.avatar_url %}
+            <img src="{{ account.avatar_url }}" alt="{{ account.account_name|default:account.account_handle }}" class="w-11 h-11 rounded-full object-cover ring-2 ring-stone-100">
+            {% else %}
+            <div class="w-11 h-11 rounded-full bg-stone-100 flex items-center justify-center text-stone-400">
+                {% if account.platform == "youtube" %}<span class="font-semibold">{{ account.account_name|default:account.account_handle|make_list|first|upper }}</span>{% else %}{% include "social_accounts/partials/_platform_icon.html" with platform=account.platform size="5" %}{% endif %}
+            </div>
+            {% endif %}
+        </div>
+
+        <!-- Info -->
+        <div class="flex-1 min-w-0">
+            <div class="flex items-center gap-2 mb-1">
+                <h3 class="text-sm font-semibold text-stone-900 truncate">{{ account.account_name|default:account.account_handle }}</h3>
+                <span class="flex-shrink-0 text-stone-400">
+                    {% if account.platform == "youtube" %}<a href="https://www.youtube.com/channel/{{ account.account_platform_id|urlencode }}" target="_blank" rel="noopener noreferrer" class="text-xs font-medium text-stone-500 underline underline-offset-2">YouTube</a>{% else %}{% include "social_accounts/partials/_platform_icon.html" with platform=account.platform size="4" %}{% endif %}
+                </span>
+            </div>
+            {% if account.account_handle %}
+            <p class="text-xs text-stone-500 truncate">@{{ account.account_handle|cut:"@" }}</p>
+            {% endif %}
+            <div class="flex items-center gap-3 mt-2">
+                {% include "social_accounts/partials/_status_badge.html" with status=account.connection_status error=account.last_error %}
+                {% if account.follower_count %}
+                <span class="text-xs text-stone-400">{{ account.follower_count|format_number }} {% if account.platform == "youtube" %}subscribers{% else %}followers{% endif %}</span>
+                {% endif %}
+            </div>
+        </div>
+
+        <!-- Actions -->
+        <div class="flex items-center gap-2" x-data="{ confirmDisconnect: false }">
+            {% if account.needs_reconnect %}
+            <form method="post" action="{% url 'social_accounts:reconnect' workspace_id=workspace_id account_id=account.id %}">
+                {% csrf_token %}
+                <button type="submit" class="inline-flex items-center px-3 py-1.5 text-xs font-semibold text-orange-700 bg-orange-50 rounded-full hover:bg-orange-100 transition-colors">
+                    Reconnect
+                </button>
+            </form>
+            {% endif %}
+
+            <!-- Disconnect -->
+            <button @click="confirmDisconnect = true" class="inline-flex items-center p-1.5 text-stone-400 hover:text-red-500 rounded-lg hover:bg-red-50 transition-colors cursor-pointer" title="Disconnect">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+            </button>
+
+            <!-- Disconnect confirmation -->
+            <div x-show="confirmDisconnect" x-cloak @click.away="confirmDisconnect = false"
+                 class="absolute right-4 top-12 z-10 w-72 bg-white rounded-xl shadow-xl border border-stone-200 p-4">
+                <p class="text-sm text-stone-700 mb-2">Disconnect <strong>{{ account.account_name|default:account.account_handle }}</strong>?</p>
+                {% comment %}
+                Say what disconnect really does; the privacy policy promises it
+                and platform reviewers read this against the policy. Only claim
+                a revocation the provider performs. The Facebook-Page flows
+                drop our copy of the credentials but cannot revoke the grant,
+                because the only endpoint that would do so revokes this app for
+                the whole person and would sever their other connected accounts.
+                {% endcomment %}
+                <p class="text-xs text-stone-500 mb-2">
+                    {% if account.revokes_platform_grant_on_disconnect %}
+                    This revokes BrightBean's access to the account.
+                    {% elif account.keeps_platform_grant_on_disconnect %}
+                    This removes the account from BrightBean only. To revoke our access entirely,
+                    remove BrightBean in Facebook &rsaquo; Settings &rsaquo; Apps and Websites.
+                    {% else %}
+                    This removes the account from BrightBean only. To revoke our access entirely,
+                    remove BrightBean in your {{ account.get_platform_display }} settings.
+                    {% endif %}
+                </p>
+                <p class="text-xs text-stone-500 mb-3">
+                    {% if account.platform == "youtube" %}
+                    YouTube data, analytics and copied comments are deleted immediately, including notification copies. Your original uploads and posts shared with other channels stay.
+                    {% else %}
+                    Its analytics, inbox messages and posts made only for it are deleted from BrightBean. Posts shared with other channels stay.
+                    {% endif %}
+                </p>
+                <div class="flex gap-2 justify-end">
+                    <button @click="confirmDisconnect = false" class="px-3 py-1.5 text-xs font-semibold text-stone-600 bg-stone-100 rounded-full hover:bg-stone-200 transition-colors cursor-pointer">Cancel</button>
+                    <form method="post"
+                          action="{% url 'social_accounts:disconnect' workspace_id=workspace_id account_id=account.id %}"
+                          hx-post="{% url 'social_accounts:disconnect' workspace_id=workspace_id account_id=account.id %}"
+                          hx-target="#account-{{ account.id }}"
+                          hx-swap="outerHTML"
+                          x-data="{ disconnecting: false }"
+                          @submit="disconnecting = true"
+                          @htmx:after-request.camel="disconnecting = false">
+                        {% csrf_token %}
+                        <button type="submit" :disabled="disconnecting" class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-red-500 rounded-full hover:bg-red-600 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed">
+                            <svg x-show="disconnecting" class="animate-spin h-3 w-3" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path></svg>
+                            <span x-text="disconnecting ? 'Disconnecting…' : 'Disconnect'">Disconnect</span>
+                        </button>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    {% comment %}
+    Meta drops permissions it has not approved, or that the user declined,
+    without failing the grant — so the connection reports healthy and only
+    breaks later, at publish or insights time, with an opaque platform error.
+    Naming them here turns that into something the user can act on.
+    {% endcomment %}
+    {% include "analytics/_instagram_status.html" %}
+    {% if account.connection_missing_scopes %}
+    <div class="mt-3 px-3 py-2 bg-amber-50 border border-amber-200 rounded-lg">
+        <p class="text-xs text-amber-800">
+            <span class="font-semibold">Some features are unavailable.</span>
+            This account was connected without {{ account.connection_missing_scopes|join:", " }}.
+            Anything relying on them will fail until the permission is granted — reconnect to try again.
+        </p>
+    </div>
+    {% endif %}
+
+    {% if account.instagram_dm_permission_request_disabled %}
+    <p class="mt-3 text-xs text-amber-800">Instagram DM access is unavailable for this connection. Contact your administrator to enable it.</p>
+    {% elif account.messaging_access is False %}
+    <p class="mt-3 text-xs text-amber-800">DMs unavailable: grant messaging access on the linked Facebook Page, then reconnect this account.</p>
+    {% endif %}
+    {% if account.last_error and account.connection_status == "error" %}
+    <div class="mt-3 px-3 py-2 bg-red-50 rounded-lg">
+        <p class="text-xs text-red-600 truncate">{{ account.last_error }}</p>
+    </div>
+    {% endif %}
+
+    {% comment %}
+    The connection is healthy enough to publish and report, and comments still
+    reach the inbox via the polling cycle — but without the subscription they
+    arrive minutes late instead of instantly, which is worth saying rather than
+    letting the account look untouched. Every failure here offers a way out:
+    "Try again" re-runs the call, and a grant that can never satisfy it offers
+    Reconnect instead.
+
+    Suppressed entirely once the *connection* is broken. A dead token can't
+    carry a subscription, so "Try again" there would be a button that provably
+    does nothing; the card already shows the connection error and its own
+    Reconnect, which is the only thing that helps. ``retry_webhooks`` refuses
+    the same accounts, so the two never disagree about what is on offer.
+    {% endcomment %}
+    {% with webhook_warning=account.webhook_warning %}
+    {% if webhook_warning and not account.needs_reconnect %}
+    <div class="mt-3 px-3 py-2 bg-amber-50 border border-amber-200 rounded-lg">
+        <div class="flex items-start justify-between gap-3">
+            <p class="text-xs text-amber-800">
+                <span class="font-semibold">Some real-time inbox updates are unavailable.</span>
+                {{ webhook_warning.message|default:"We couldn't set up real-time updates for this account." }}
+                Activity with the required permissions can still arrive through polling.
+            </p>
+            {% if webhook_warning.needs_reconnect %}
+            <form method="post" action="{% url 'social_accounts:reconnect' workspace_id=workspace_id account_id=account.id %}">
+                {% csrf_token %}
+                <button type="submit" class="inline-flex flex-shrink-0 items-center whitespace-nowrap px-3 py-1.5 text-xs font-semibold text-amber-800 bg-amber-100 rounded-full hover:bg-amber-200 transition-colors cursor-pointer">
+                    Reconnect
+                </button>
+            </form>
+            {% else %}
+            {% comment %}
+            method/action as well as hx-post: without them a browser that never
+            ran htmx falls back to the form default — GET to the current URL,
+            which puts the CSRF token in the query string and retries nothing.
+            @htmx:after-request re-enables the button when a request fails,
+            since htmx only swaps this card away on success.
+            {% endcomment %}
+            <form method="post"
+                  action="{% url 'social_accounts:retry_webhooks' workspace_id=workspace_id account_id=account.id %}"
+                  hx-post="{% url 'social_accounts:retry_webhooks' workspace_id=workspace_id account_id=account.id %}"
+                  hx-target="#account-{{ account.id }}"
+                  hx-swap="outerHTML"
+                  x-data="{ retrying: false }"
+                  @submit="retrying = true"
+                  @htmx:after-request.camel="retrying = false">
+                {% csrf_token %}
+                <button type="submit" :disabled="retrying" class="inline-flex flex-shrink-0 items-center whitespace-nowrap gap-1.5 px-3 py-1.5 text-xs font-semibold text-amber-800 bg-amber-100 rounded-full hover:bg-amber-200 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed">
+                    <svg x-show="retrying" x-cloak class="animate-spin h-3 w-3" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path></svg>
+                    <span x-text="retrying ? 'Trying…' : 'Try again'">Try again</span>
+                </button>
+            </form>
+            {% endif %}
+        </div>
+    </div>
+    {% endif %}
+    {% endwith %}
+
+    <!-- Posting Schedule -->
+    {% if account.connection_status == "connected" %}
+    <div class="border-t border-stone-100 mt-4 pt-4">
+        <div class="mb-3">
+            <h4 class="text-xs font-semibold text-stone-700 uppercase tracking-wider">Posting Schedule</h4>
+            <p class="text-xs text-stone-400 mt-0.5">Set recurring time slots for when queued posts are automatically published.</p>
+        </div>
+        {% include "social_accounts/partials/_posting_slots_grid.html" with account=account workspace_id=workspace_id %}
+    </div>
+    {% endif %}
+</div>

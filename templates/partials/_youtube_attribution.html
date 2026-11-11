@@ -1,0 +1,8 @@
+{# Plain source attribution, using the application's normal type rather than a logo or wordmark. #}
+<div class="youtube-attribution" style="display:flex; flex-shrink:0; flex-wrap:wrap; align-items:baseline; gap:4px 8px; {% if youtube_compact %}margin:4px 0 0;{% else %}margin:12px 0;{% endif %} color:var(--text-secondary, #57534e); line-height:1.5;">
+    <a {% if youtube_alpine_link %}:href="charLimits[accId]?.youtube_url || 'https://www.youtube.com/'"{% endif %} href="{% if youtube_video_id %}https://www.youtube.com/watch?v={{ youtube_video_id|urlencode }}{% elif youtube_account.account_platform_id %}https://www.youtube.com/channel/{{ youtube_account.account_platform_id|urlencode }}{% else %}https://www.youtube.com/{% endif %}" @click.stop target="_blank" rel="noopener noreferrer" aria-label="Open on YouTube" style="font-size:13px; font-weight:600; color:var(--text-secondary, #57534e); text-decoration:underline; text-underline-offset:3px;">
+        YouTube
+    </a>
+    {% if youtube_account.account_name %}<span aria-hidden="true">·</span><span style="font-size:13px; font-weight:500; overflow-wrap:anywhere;">{{ youtube_account.account_name }}</span>{% endif %}
+    {% if youtube_attribution_label %}<span style="font-size:12px;">{{ youtube_attribution_label }}</span>{% endif %}
+</div>

@@ -1,0 +1,48 @@
+{% load common_extras %}{% comment %}
+List mode shell for the Publish page.
+Contains tabs (Queue, Drafts, Approvals, Sent), filter dropdowns, and tab content area.
+Tab switching is HTMX partial swaps only - no full page reload.
+{% endcomment %}
+
+<div x-data="publishList()" class="flex-1 flex flex-col min-h-0">
+    <!-- Tabs + Filters row -->
+    <div class="flex flex-wrap items-center justify-between border-b border-stone-200 pb-0 -mx-3 sm:-mx-4 lg:-mx-6 px-3 sm:px-4 lg:px-6 gap-y-2">
+        <!-- Left: tabs -->
+        <div class="flex items-center gap-1 -mb-px overflow-x-auto flex-nowrap">
+            <button class="publish-tab" :class="activeTab === 'queue' && 'active'"
+                    @click="switchTab('queue')">
+                Queue <span id="tabcount-queue">{% include "calendar/partials/_tab_count_badge.html" with count=queue_count %}</span>
+            </button>
+            <button class="publish-tab" :class="activeTab === 'drafts' && 'active'"
+                    @click="switchTab('drafts')">
+                Drafts <span id="tabcount-drafts">{% include "calendar/partials/_tab_count_badge.html" with count=drafts_count %}</span>
+            </button>
+            <button class="publish-tab" :class="activeTab === 'approvals' && 'active'"
+                    @click="switchTab('approvals')">
+                Approvals <span id="tabcount-approvals">{% include "calendar/partials/_tab_count_badge.html" with count=approvals_count %}</span>
+            </button>
+            <button class="publish-tab" :class="activeTab === 'sent' && 'active'"
+                    @click="switchTab('sent')">
+                Sent <span id="tabcount-sent">{% include "calendar/partials/_tab_count_badge.html" with count=sent_count %}</span>
+            </button>
+        </div>
+
+        <!-- Right: filter dropdowns -->
+        <div class="flex items-center gap-2 pb-2 overflow-x-auto flex-shrink-0">
+            <!-- Channels filter (multi-select) -->
+            {% ui_select model="selectedChannels" options=channels_with_posts multiple=True onchange="reloadTab()" placeholder="Channels" icon="channel" label_field="display_label" icon_field="platform" %}
+
+            <!-- Tags filter -->
+            {% ui_select model="activeTag" options=all_tags onchange="reloadTab()" placeholder="All Tags" icon="tag" %}
+
+            <!-- Timezone dropdown -->
+            {% ui_select model="displayTimezone" options=timezone_options onchange="reloadTab()" placeholder="Timezone" icon="clock" %}
+        </div>
+    </div>
+
+    <!-- Tab content area (swapped by HTMX on tab/filter changes). -->
+    <!-- Initial tab is rendered server-side to avoid a spinner-then-content shift. -->
+    <div id="tab-content" class="mt-4 flex-1 min-h-0 overflow-y-auto flex justify-center [&>*]:w-full [&>*]:max-w-4xl">
+        {% include initial_tab_template %}
+    </div>
+</div>

@@ -1,0 +1,5 @@
+{% load static %}
+{# Match the original 20px icon width, or 24px in the account-selection header, including the supplied clear space. #}
+<a class="youtube-brand-icon" href="https://www.youtube.com/" target="_blank" rel="noopener noreferrer" aria-label="Open YouTube" style="display:inline-flex; flex-shrink:0; background:#fff; line-height:0;">
+    <img src="{% static 'brand/youtube/icon-red.png' %}" alt="YouTube" width="1255" height="1075" style="display:block; height:{% if size == '24' %}31.2{% else %}26{% endif %}px; width:auto; max-width:none;">
+</a>

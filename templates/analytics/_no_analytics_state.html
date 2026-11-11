@@ -1,0 +1,40 @@
+{% load analytics_extras %}
+<div style="flex: 1; display: flex; align-items: center; justify-content: center; padding: 40px;">
+    <div style="text-align: center; max-width: 460px;">
+        <div style="position: relative; width: 72px; height: 72px; margin: 0 auto 20px;">
+            <div style="width: 72px; height: 72px; border-radius: var(--radius-2xl); background: var(--surface-2); display: flex; align-items: center; justify-content: center;">
+                {% include "partials/_platform_icon.html" with platform=active_account.platform size="lg" %}
+            </div>
+        </div>
+        <h2 style="font-size: 1.5rem; font-weight: 700; color: var(--text-primary); margin-bottom: 8px; letter-spacing: -0.01em;">
+            Analytics aren't available for {{ active_account.get_platform_display }}
+        </h2>
+        <p style="font-size: 0.9375rem; color: var(--text-secondary); line-height: 1.6;">
+            {{ analytics_unavailable_notice }}
+        </p>
+        {% if analytics_disabled_by_admin %}
+        {% comment %}
+        Admin-disabled, not an API limitation — so unlike the LinkedIn Personal
+        / Bluesky / Mastodon copy above, there is something to do about it.
+        "May need reconnecting" rather than a promise that this page will offer
+        the button: whether the stored token can read insights depends on the
+        platform (Instagram Direct now always asks for the scope; Facebook /
+        TikTok / YouTube still gate theirs on this toggle), and the re-check
+        that surfaces the Reconnect banner is a background task — it doesn't
+        run if the worker is down, and a bulk queryset.update() of the toggle
+        fires no signal at all. Advice that holds in every one of those cases
+        beats advice that is usually superseded. The id is what the view test
+        anchors on, so this copy can be reworded freely. ({# #} is single-line
+        only in Django — a multi-line one renders as visible page text.)
+        {% endcomment %}
+        <p id="analytics-disabled-admin-note" style="font-size: 0.875rem; color: var(--text-tertiary); line-height: 1.6; margin-top: 12px;">
+            An administrator can switch it on under <strong>Analytics platforms</strong> in the
+            Django admin. If this account connected while it was off, it may also need
+            reconnecting before insights can be read.
+        </p>
+        {% endif %}
+        <div style="margin-top: 28px; display: flex; gap: 10px; justify-content: center;">
+            <a href="{% url 'composer:create_landing' workspace_id=workspace.id %}" class="btn-brand" style="width: auto; padding: 9px 20px;">Create a post</a>
+        </div>
+    </div>
+</div>

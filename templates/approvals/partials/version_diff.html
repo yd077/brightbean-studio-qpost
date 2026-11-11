@@ -1,0 +1,47 @@
+<div class="space-y-4">
+    {% if diff_data.caption_changed %}
+    <div>
+        <h4 class="text-[0.8125rem] font-semibold text-stone-700 mb-2">Caption Changes</h4>
+        <div class="flex items-center gap-3 mb-2 text-[0.6875rem] font-medium">
+            <span class="inline-flex items-center gap-1 text-emerald-700"><span class="w-3 h-3 rounded" style="background:#DCFCE7;"></span> Added</span>
+            <span class="inline-flex items-center gap-1 text-red-700"><span class="w-3 h-3 rounded" style="background:#FEE2E2;"></span> Removed</span>
+        </div>
+        <div class="rounded-xl border border-stone-200 bg-stone-50 p-4 max-h-[360px] overflow-y-auto">
+            <p class="text-[0.875rem] leading-relaxed whitespace-pre-wrap">{% for tok in diff_data.caption_diff %}{% if tok.k == 'same' %}<span class="text-stone-600">{{ tok.t }}</span>{% elif tok.k == 'add' %}<span class="rounded px-0.5" style="background:#DCFCE7;color:#15803D;">{{ tok.t }}</span>{% else %}<span class="rounded px-0.5 line-through" style="background:#FEE2E2;color:#B91C1C;">{{ tok.t }}</span>{% endif %}{% endfor %}</p>
+        </div>
+    </div>
+    {% else %}
+    <p class="text-sm text-stone-400">No caption changes</p>
+    {% endif %}
+
+    {% if diff_data.media_changed %}
+    <div>
+        <h4 class="text-[0.8125rem] font-semibold text-stone-700 mb-2">Media Changes</h4>
+        <div class="grid grid-cols-2 gap-3">
+            <div class="p-3 rounded-lg bg-red-50 border border-red-100">
+                <p class="text-[0.6875rem] font-semibold text-red-600 mb-1">Previous ({{ diff_data.media_old|length }} items)</p>
+                <div class="flex gap-1 flex-wrap">
+                    {% for m in diff_data.media_old %}
+                    <div class="w-10 h-10 rounded bg-stone-200 flex items-center justify-center text-[8px] text-stone-500">{{ m.media_asset_id|truncatechars:6 }}</div>
+                    {% endfor %}
+                </div>
+            </div>
+            <div class="p-3 rounded-lg bg-emerald-50 border border-emerald-100">
+                <p class="text-[0.6875rem] font-semibold text-emerald-600 mb-1">Current ({{ diff_data.media_new|length }} items)</p>
+                <div class="flex gap-1 flex-wrap">
+                    {% for m in diff_data.media_new %}
+                    <div class="w-10 h-10 rounded bg-stone-200 flex items-center justify-center text-[8px] text-stone-500">{{ m.media_asset_id|truncatechars:6 }}</div>
+                    {% endfor %}
+                </div>
+            </div>
+        </div>
+    </div>
+    {% endif %}
+
+    {% if diff_data.platforms_changed %}
+    <div>
+        <h4 class="text-[0.8125rem] font-semibold text-stone-700 mb-2">Platform Changes</h4>
+        <p class="text-sm text-stone-500">Target platforms have been modified.</p>
+    </div>
+    {% endif %}
+</div>

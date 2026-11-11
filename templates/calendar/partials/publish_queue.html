@@ -1,0 +1,126 @@
+{% if render_tab_counts_oob %}{% include "calendar/partials/_tab_counts_oob.html" %}{% endif %}
+{% comment %}
+Queue tab partial for the Publish page.
+Shows all scheduled platform posts grouped by date. Loaded via HTMX into #tab-content.
+{% endcomment %}
+{% load tz %}
+
+<div{% if is_htmx %} class="tab-slide-in"{% endif %}>
+    {% if platform_posts %}
+    {% regroup platform_posts by effective_at.date as date_groups %}
+    {% for group in date_groups %}
+    <div class="{% if not forloop.first %}mt-8{% endif %}">
+        <!-- Date header -->
+        <h3 class="text-base font-semibold text-stone-800 mb-4">
+            {% timezone display_timezone %}{{ group.grouper|date:"l, j F" }}{% endtimezone %}
+        </h3>
+
+        <div class="space-y-4">
+            {% for pp in group.list %}
+            <div class="flex gap-4">
+                <!-- Bulk-select checkbox -->
+                <div class="flex items-center shrink-0 pt-3">
+                    {% if pp.is_bulk_selectable %}{% include "calendar/partials/_select_checkbox.html" with pp_id=pp.id extra_class="row-select-box" %}{% endif %}
+                </div>
+                <!-- Left: time + source -->
+                <div class="w-20 shrink-0 pt-3 text-right">
+                    <div class="text-sm font-semibold text-stone-700 tabular-nums">
+                        {% timezone display_timezone %}{{ pp.effective_at|date:"g:i A" }}{% endtimezone %}
+                    </div>
+                    <div class="text-[11px] text-stone-400 mt-0.5 flex items-center justify-end gap-1">
+                        <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+                        {% if pp.post.queue_entries.exists %}Queue{% else %}Custom{% endif %}
+                    </div>
+                </div>
+
+                <!-- Right: post card -->
+                <div x-data class="flex-1 bg-white rounded-xl border border-stone-200 hover:border-stone-300 transition-colors group">
+                    <div class="p-4 cursor-pointer" @click="window.location='{% url 'composer:compose_edit' workspace_id=workspace.id post_id=pp.post_id %}?account={{ pp.social_account_id }}'">
+                        <!-- Channel info -->
+                        <div class="flex items-center gap-2 mb-2">
+                            <span class="w-6 h-6 rounded-md flex items-center justify-center">
+                                {% include "partials/_platform_icon.html" with platform=pp.social_account.platform size="sm" %}
+                            </span>
+                            <span class="text-sm font-semibold text-stone-800">
+                                {{ pp.social_account.account_name|default:pp.social_account.account_handle }}
+                            </span>
+                        </div>
+
+                        <!-- Title / caption -->
+                        <p class="text-sm text-stone-600 leading-relaxed">
+                            {{ pp.post.title|default:pp.post.caption_snippet|default:"(no caption)" }}
+                        </p>
+
+                        <!-- Media thumbnails -->
+                        {% if pp.post.media_attachments.exists %}
+                        <div class="flex gap-1.5 mt-2.5">
+                            {% for att in pp.post.media_attachments.all|slice:":4" %}
+                            <div class="w-12 h-12 rounded-lg overflow-hidden bg-stone-100 flex-shrink-0 relative">
+                                {% if att.media_asset.thumbnail %}
+                                    <img src="{{ att.media_asset.thumbnail.url }}" alt="" class="w-full h-full object-cover">
+                                {% elif att.media_asset.media_type == 'image' or att.media_asset.media_type == 'gif' %}
+                                    <img src="{{ att.media_asset.file.url }}" alt="" class="w-full h-full object-cover">
+                                {% else %}
+                                    <video src="{{ att.media_asset.file.url }}#t=0.5" class="w-full h-full object-cover" muted preload="metadata"></video>
+                                {% endif %}
+                                {% if att.media_asset.media_type == 'video' %}
+                                <div class="absolute inset-0 flex items-center justify-center">
+                                    <div class="w-5 h-5 rounded-full bg-black/50 flex items-center justify-center">
+                                        <svg class="w-2.5 h-2.5 text-white ml-0.5" fill="currentColor" viewBox="0 0 24 24"><path d="M5 3l14 9-14 9V3z"/></svg>
+                                    </div>
+                                </div>
+                                {% endif %}
+                            </div>
+                            {% endfor %}
+                            {% with extra=pp.post.media_attachments.count %}
+                            {% if extra > 4 %}
+                            <div class="w-12 h-12 rounded-lg bg-stone-100 flex items-center justify-center flex-shrink-0">
+                                <span class="text-xs font-semibold text-stone-400">+{{ extra|add:"-4" }}</span>
+                            </div>
+                            {% endif %}
+                            {% endwith %}
+                        </div>
+                        {% endif %}
+                    </div>
+
+                    <!-- Footer -->
+                    <div class="flex items-center justify-between border-t border-stone-100 px-4 py-2.5">
+                        <span class="text-xs text-stone-400">
+                            {{ pp.post.created_at|timesince }} ago
+                        </span>
+                        <div class="flex items-center gap-1.5">
+                            <a href="{% url 'composer:compose_edit' workspace_id=workspace.id post_id=pp.post_id %}?account={{ pp.social_account_id }}&action=publish_now"
+                               class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-full border border-stone-200 text-stone-600 hover:border-stone-300 hover:text-stone-800 transition-colors">
+                                <svg class="w-3.5 h-3.5 rotate-90" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"/></svg>
+                                Publish
+                            </a>
+                            {% include "calendar/partials/_post_actions_menu.html" with post_id=pp.post_id account_id=pp.social_account_id %}
+                        </div>
+                    </div>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+    {% endfor %}
+    {% else %}
+    {% if not has_connected_accounts %}
+    {% include "calendar/partials/_no_channels_empty_state.html" %}
+    {% else %}
+    <div class="text-center py-20 px-6">
+        <div class="w-16 h-16 mx-auto rounded-2xl bg-stone-100 flex items-center justify-center mb-4">
+            <svg class="w-7 h-7 text-stone-300" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+        </div>
+        <p class="text-sm font-medium text-stone-500 mb-1">No queued posts</p>
+        <p class="text-xs text-stone-400 mb-5 max-w-[240px] mx-auto">Queued posts will appear here when you queue them</p>
+        <a href="{% url 'composer:compose' workspace_id=workspace.id %}"
+           class="inline-flex items-center gap-1.5 px-5 py-1.5 text-sm font-semibold text-orange-600 bg-orange-50 border border-orange-200 rounded-full hover:bg-orange-100 hover:border-orange-300 active:bg-orange-100 transition-all duration-150">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>
+            Create Post
+        </a>
+    </div>
+    {% endif %}
+    {% endif %}
+</div>
+
+{% include "calendar/partials/_delete_post_modal.html" %}

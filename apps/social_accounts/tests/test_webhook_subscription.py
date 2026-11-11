@@ -1,0 +1,840 @@
+"""Connecting an account subscribes its webhooks; disconnecting removes them.
+
+Without the subscribe call, comments reach the inbox only on the five-minute
+polling cycle instead of instantly — degraded, not broken, which is what the
+warning and its retry button have to convey.
+"""
+
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from apps.social_accounts.error_messages import (
+    WEBHOOK_GENERIC_MESSAGE,
+    WEBHOOK_RECONNECT_MESSAGE,
+    WEBHOOK_REJECTED_MESSAGE,
+    WEBHOOK_UNAVAILABLE_MESSAGE,
+)
+from apps.social_accounts.models import SocialAccount
+from apps.social_accounts.views import _create_or_update_account
+from apps.social_accounts.webhooks import (
+    MAX_AUTOMATIC_RETRIES,
+    retry_failed_subscription,
+    subscribe_account_webhooks,
+    supports_webhooks,
+    unsubscribe_account_webhooks,
+    webhook_target,
+)
+
+
+@pytest.fixture
+def workspace(db, organization):
+    from apps.workspaces.models import Workspace
+
+    return Workspace.objects.create(name="Webhook WS", organization=organization)
+
+
+class _WebhookProvider:
+    """A provider that implements the webhook methods, like the Meta ones do."""
+
+    def __init__(self, *, subscribe=True, unsubscribe=True, error=None):
+        self._subscribe = subscribe
+        self._unsubscribe = unsubscribe
+        self._error = error
+        self.subscribe_calls = []
+        self.unsubscribe_calls = []
+
+    def subscribe_webhooks(self, access_token, account_id):
+        self.subscribe_calls.append((access_token, account_id))
+        if self._error:
+            raise self._error
+        return self._subscribe
+
+    def unsubscribe_webhooks(self, access_token, account_id):
+        self.unsubscribe_calls.append((access_token, account_id))
+        if self._error:
+            raise self._error
+        return self._unsubscribe
+
+
+def _profile(platform_id="page-1", name="Test Page"):
+    return SimpleNamespace(
+        platform_id=platform_id,
+        name=name,
+        handle="testpage",
+        avatar_url="",
+        follower_count=10,
+    )
+
+
+def _account(workspace, **kwargs):
+    defaults = {
+        "workspace": workspace,
+        "platform": "facebook",
+        "account_platform_id": "page-1",
+        "account_name": "Page",
+        "oauth_access_token": "page-token",
+    }
+    return SocialAccount.objects.create(**{**defaults, **kwargs})
+
+
+# --------------------------------------------------------------- enqueueing
+
+
+def test_connecting_an_account_enqueues_the_subscription(workspace):
+    """The subscribe call is a network round trip, so it must not block OAuth."""
+    with patch("apps.social_accounts.views.subscribe_account_webhooks_task") as task:
+        account = _create_or_update_account(
+            workspace_id=workspace.id,
+            platform="facebook",
+            profile=_profile(),
+            access_token="page-token",
+        )
+
+    task.assert_called_once_with(str(account.id))
+
+
+def test_reconnecting_clears_a_previous_webhook_failure(workspace):
+    """The warning must not outlive the reconnect it asked for.
+
+    A stale False would otherwise survive a perfectly good new grant — leaving
+    the card telling the user to do the thing they just did.
+    """
+    _account(
+        workspace,
+        account_platform_id="page-1",
+        webhooks_active=False,
+        webhook_error="an old failure",
+        webhook_needs_reconnect=True,
+    )
+
+    with patch("apps.social_accounts.views.subscribe_account_webhooks_task"):
+        account = _create_or_update_account(
+            workspace_id=workspace.id,
+            platform="facebook",
+            profile=_profile(),
+            access_token="fresh-token",
+        )
+
+    assert account.webhooks_active is None
+    assert account.webhook_error == ""
+    assert account.webhook_needs_reconnect is False
+
+
+def test_instagram_remembers_the_linked_page_as_its_webhook_target(workspace):
+    """IG-via-Facebook receives events on the Page, not the IG account."""
+    with patch("apps.social_accounts.views.subscribe_account_webhooks_task"):
+        account = _create_or_update_account(
+            workspace_id=workspace.id,
+            platform="instagram",
+            profile=_profile(platform_id="ig-99", name="Test IG"),
+            access_token="page-token",
+            webhook_target_id="page-77",
+        )
+
+    assert account.webhook_target_id == "page-77"
+    # Stored for _is_own_activity, but NOT what we subscribe: comments/mentions
+    # are Instagram-object fields and a Page rejects them outright.
+    assert webhook_target(account) == "ig-99"
+
+
+def test_webhook_target_is_always_the_account_itself(workspace):
+    assert webhook_target(_account(workspace, account_platform_id="page-5")) == "page-5"
+
+
+# -------------------------------------------------------------- subscribing
+
+
+def test_subscribe_targets_the_instagram_user_not_its_linked_page(workspace):
+    """Meta answers comments/mentions on a Page with "(#100) Param
+    subscribed_fields[0] must be one of {feed, mention, ...}", so every account
+    subscribed against the Page was left with a permanently deaf inbox."""
+    account = _account(workspace, platform="instagram", account_platform_id="ig-99", webhook_target_id="page-77")
+    provider = _WebhookProvider()
+
+    with patch("apps.social_accounts.webhooks._get_provider_for_platform", return_value=provider):
+        assert subscribe_account_webhooks(account) is True
+
+    assert provider.subscribe_calls == [("page-token", "ig-99")]
+
+
+def test_a_failed_subscription_is_recorded_on_the_account(workspace):
+    """The connection stays live, but the user must be able to see it is degraded."""
+    account = _account(workspace)
+    provider = _WebhookProvider(error=RuntimeError("Meta said no"))
+
+    with patch("apps.social_accounts.webhooks._get_provider_for_platform", return_value=provider):
+        assert subscribe_account_webhooks(account) is False
+
+    account.refresh_from_db()
+    assert account.webhooks_active is False
+    assert account.webhook_error == WEBHOOK_GENERIC_MESSAGE
+    # Retryable in place: nothing here says the grant is the problem.
+    assert account.webhook_needs_reconnect is False
+    # The connection itself is fine — publishing and analytics still work — and
+    # last_error belongs to the periodic health check, which would wipe ours.
+    assert account.connection_status == SocialAccount.ConnectionStatus.CONNECTED
+    assert account.last_error == ""
+
+
+def test_a_declined_subscription_is_also_recorded(workspace):
+    account = _account(workspace)
+    provider = _WebhookProvider(subscribe=False)
+
+    with patch("apps.social_accounts.webhooks._get_provider_for_platform", return_value=provider):
+        assert subscribe_account_webhooks(account) is False
+
+    account.refresh_from_db()
+    assert account.webhooks_active is False
+    assert account.webhook_error == WEBHOOK_REJECTED_MESSAGE
+
+
+def test_the_stored_message_never_carries_the_platforms_payload(workspace):
+    """The card renders webhook_error verbatim.
+
+    The bug this guards: Meta's rejection arrived as
+    ``APIError('Instagram API error 400: {"error":{"message":"(#100) Param
+    subscribed_fields[0] must be one of {feed, mention, ...')`` — built from
+    ``response.text[:500]`` — and was shown to the user, truncated mid-token.
+    """
+    from providers.exceptions import APIError
+
+    account = _account(workspace)
+    payload = '{"error":{"message":"(#100) Param subscribed_fields[0] must be one of {feed, mention, name"}}'
+    provider = _WebhookProvider(error=APIError(f"Instagram API error 400: {payload}", status_code=400))
+
+    with patch("apps.social_accounts.webhooks._get_provider_for_platform", return_value=provider):
+        subscribe_account_webhooks(account)
+
+    account.refresh_from_db()
+    assert account.webhook_error == WEBHOOK_REJECTED_MESSAGE
+    assert "subscribed_fields" not in account.webhook_error
+    assert '{"' not in account.webhook_error
+
+
+def test_an_auth_failure_asks_for_a_reconnect_instead_of_a_retry(workspace):
+    """A 403 means the grant can't satisfy the call; retrying it forever won't help."""
+    from providers.exceptions import APIError
+
+    account = _account(workspace)
+    provider = _WebhookProvider(error=APIError("nope", status_code=403))
+
+    with patch("apps.social_accounts.webhooks._get_provider_for_platform", return_value=provider):
+        subscribe_account_webhooks(account)
+
+    account.refresh_from_db()
+    assert account.webhook_needs_reconnect is True
+    assert account.webhook_error == WEBHOOK_RECONNECT_MESSAGE
+
+
+def test_a_later_success_clears_the_reconnect_prompt(workspace):
+    account = _account(workspace, webhooks_active=False, webhook_needs_reconnect=True, webhook_error="stale")
+    provider = _WebhookProvider()
+
+    with patch("apps.social_accounts.webhooks._get_provider_for_platform", return_value=provider):
+        assert subscribe_account_webhooks(account) is True
+
+    account.refresh_from_db()
+    assert account.webhooks_active is True
+    assert account.webhook_error == ""
+    assert account.webhook_needs_reconnect is False
+
+
+def test_a_platform_without_webhooks_is_not_an_error(workspace):
+    """Bluesky has no webhooks; that must not look like a failed subscription."""
+    from providers.bluesky import BlueskyProvider
+
+    account = _account(workspace, platform="bluesky")
+
+    with patch("apps.social_accounts.webhooks._get_provider_for_platform", return_value=BlueskyProvider({})):
+        assert subscribe_account_webhooks(account) is False
+
+    account.refresh_from_db()
+    assert account.webhooks_active is None
+    assert account.webhook_error == ""
+
+
+def test_supports_webhooks_distinguishes_real_implementations():
+    from providers.bluesky import BlueskyProvider
+    from providers.facebook import FacebookProvider
+
+    assert supports_webhooks(FacebookProvider({})) is True
+    assert supports_webhooks(BlueskyProvider({})) is False
+
+
+# ------------------------------------------------------------ unsubscribing
+
+
+def test_unsubscribe_targets_the_same_object_subscribe_did(workspace):
+    account = _account(workspace, platform="instagram", account_platform_id="ig-99", webhook_target_id="page-77")
+    provider = _WebhookProvider()
+
+    with patch("apps.social_accounts.webhooks._get_provider_for_platform", return_value=provider):
+        assert unsubscribe_account_webhooks(account) is True
+
+    assert provider.unsubscribe_calls == [("page-token", "ig-99")]
+
+
+def test_unsubscribe_failure_is_swallowed_so_disconnect_still_happens(workspace):
+    account = _account(workspace)
+    provider = _WebhookProvider(error=RuntimeError("gone"))
+
+    with patch("apps.social_accounts.webhooks._get_provider_for_platform", return_value=provider):
+        assert unsubscribe_account_webhooks(account) is False
+
+
+# ---------------------------------------------------------------- the task
+
+
+def test_the_background_task_skips_a_deleted_account(workspace, db):
+    from apps.social_accounts.webhooks import subscribe_account_webhooks_task
+
+    with patch("apps.social_accounts.webhooks.subscribe_account_webhooks") as subscribe:
+        subscribe_account_webhooks_task.now("00000000-0000-0000-0000-000000000000")
+
+    subscribe.assert_not_called()
+
+
+def test_the_background_task_subscribes_an_existing_account(workspace):
+    from apps.social_accounts.webhooks import subscribe_account_webhooks_task
+
+    account = _account(workspace)
+    provider = _WebhookProvider()
+
+    with patch("apps.social_accounts.webhooks._get_provider_for_platform", return_value=provider):
+        subscribe_account_webhooks_task.now(str(account.id))
+
+    assert provider.subscribe_calls == [("page-token", "page-1")]
+
+
+# --------------------------------------------- the other multi-page entry point
+
+
+@pytest.mark.django_db
+def test_connection_link_flow_passes_the_page_as_the_webhook_target(client, workspace):
+    """The client-facing connection link is a second Facebook/Instagram entry point.
+
+    It has its own page loop, so an Instagram account connected by a client
+    must record the linked Page just as select_account does.
+    """
+    from django.urls import reverse
+    from django.utils import timezone
+
+    from apps.onboarding.models import ConnectionLink
+    from apps.onboarding.views import CONNECTION_LINK_OAUTH_SESSION_KEY, _sign_connection_link_state
+    from providers.types import AccountProfile, OAuthTokens
+
+    link = ConnectionLink.objects.create(
+        workspace=workspace,
+        expires_at=timezone.now() + timezone.timedelta(days=1),
+    )
+    nonce = "nonce-ig"
+    state = _sign_connection_link_state(workspace.id, "instagram", link.token, nonce)
+    session = client.session
+    session[CONNECTION_LINK_OAUTH_SESSION_KEY] = {
+        "nonce": nonce,
+        "workspace_id": str(workspace.id),
+        "platform": "instagram",
+        "token": link.token,
+        "code_verifier": "",
+    }
+    session.save()
+
+    provider = MagicMock()
+    provider.exchange_code.return_value = OAuthTokens(access_token="user-token", refresh_token="r", expires_in=3600)
+    provider.refresh_token.return_value = OAuthTokens(access_token="long-lived-user-token", expires_in=5184000)
+    provider.get_profile.return_value = AccountProfile(platform_id="ig-99", name="IG")
+    provider.get_user_pages.return_value = [
+        {
+            "id": "ig-99",
+            "name": "Northlight IG",
+            "handle": "northlight",
+            "picture": "",
+            "followers_count": 5,
+            "page_id": "page-77",
+            "access_token": "page-token",
+        }
+    ]
+
+    with (
+        patch("apps.onboarding.views._get_provider_for_platform", return_value=provider),
+        patch("apps.social_accounts.views.subscribe_account_webhooks_task"),
+    ):
+        response = client.get(
+            reverse("onboarding:oauth_callback", kwargs={"platform": "instagram"}),
+            {"code": "auth-code", "state": state},
+        )
+
+    assert response.status_code == 302
+    account = SocialAccount.objects.get(workspace=workspace, platform="instagram")
+    assert account.webhook_target_id == "page-77"
+    assert account.oauth_access_token == "page-token"
+    assert account.oauth_refresh_token == ""
+    assert account.token_expires_at is None
+    provider.get_user_pages.assert_called_once_with("long-lived-user-token")
+
+
+# ------------------------------------------- subscriptions shared across rows
+
+
+def test_a_shared_subscription_is_left_in_place(workspace, organization):
+    """The subscription belongs to the Page, not to our row.
+
+    The same Page can be connected in two workspaces; unsubscribing on one
+    disconnect would silence the other's inbox too.
+    """
+    from apps.workspaces.models import Workspace
+
+    other_ws = Workspace.objects.create(name="Other WS", organization=organization)
+    account = _account(workspace, account_platform_id="page-shared")
+    _account(other_ws, account_platform_id="page-shared")
+    provider = _WebhookProvider()
+
+    with patch("apps.social_accounts.webhooks._get_provider_for_platform", return_value=provider):
+        assert unsubscribe_account_webhooks(account) is False
+
+    assert provider.unsubscribe_calls == []
+
+
+def test_the_last_connection_does_unsubscribe(workspace, organization):
+    from apps.workspaces.models import Workspace
+
+    other_ws = Workspace.objects.create(name="Other WS", organization=organization)
+    account = _account(workspace, account_platform_id="page-solo")
+    # A different Page, and a disconnected row on the same Page, must not count.
+    _account(other_ws, account_platform_id="page-elsewhere")
+    _account(
+        other_ws,
+        account_platform_id="page-solo",
+        connection_status=SocialAccount.ConnectionStatus.DISCONNECTED,
+    )
+    provider = _WebhookProvider()
+
+    with patch("apps.social_accounts.webhooks._get_provider_for_platform", return_value=provider):
+        assert unsubscribe_account_webhooks(account) is True
+
+    assert provider.unsubscribe_calls == [("page-token", "page-solo")]
+
+
+def test_the_same_instagram_account_in_two_workspaces_is_protected(workspace, organization):
+    """The subscription belongs to the IG user, so a second workspace holding
+    the same account still depends on it."""
+    from apps.workspaces.models import Workspace
+
+    other_ws = Workspace.objects.create(name="Other WS", organization=organization)
+    account = _account(workspace, platform="instagram", account_platform_id="ig-1", webhook_target_id="page-77")
+    _account(other_ws, platform="instagram", account_platform_id="ig-1", webhook_target_id="page-77")
+    provider = _WebhookProvider()
+
+    with patch("apps.social_accounts.webhooks._get_provider_for_platform", return_value=provider):
+        assert unsubscribe_account_webhooks(account) is False
+
+    assert provider.unsubscribe_calls == []
+
+
+def test_two_instagram_accounts_sharing_a_page_do_not_share_a_subscription(workspace, organization):
+    """Each IG user carries its own subscription now, so disconnecting one must
+    not leave the other's dangling."""
+    from apps.workspaces.models import Workspace
+
+    other_ws = Workspace.objects.create(name="Other WS", organization=organization)
+    account = _account(workspace, platform="instagram", account_platform_id="ig-1", webhook_target_id="page-77")
+    _account(other_ws, platform="instagram", account_platform_id="ig-2", webhook_target_id="page-77")
+    provider = _WebhookProvider()
+
+    with patch("apps.social_accounts.webhooks._get_provider_for_platform", return_value=provider):
+        assert unsubscribe_account_webhooks(account) is True
+
+    assert provider.unsubscribe_calls == [("page-token", "ig-1")]
+
+
+# ------------------------------------------------------- the backfill command
+
+
+def test_the_backfill_command_subscribes_accounts_connected_before_this_existed(workspace):
+    """Existing accounts never run the connect path, so they stay unsubscribed."""
+    from io import StringIO
+
+    from django.core.management import call_command
+
+    account = _account(workspace, account_platform_id="page-legacy")
+    assert account.webhooks_active is None
+    provider = _WebhookProvider()
+
+    out = StringIO()
+    with patch("apps.social_accounts.webhooks._get_provider_for_platform", return_value=provider):
+        call_command("subscribe_webhooks", stdout=out)
+
+    assert provider.subscribe_calls == [("page-token", "page-legacy")]
+    account.refresh_from_db()
+    assert account.webhooks_active is True
+
+
+def test_the_backfill_command_skips_already_subscribed_accounts(workspace):
+    from io import StringIO
+
+    from django.core.management import call_command
+
+    _account(workspace, account_platform_id="page-done", webhooks_active=True)
+    provider = _WebhookProvider()
+
+    with patch("apps.social_accounts.webhooks._get_provider_for_platform", return_value=provider):
+        call_command("subscribe_webhooks", stdout=StringIO())
+
+    assert provider.subscribe_calls == []
+
+
+def test_the_backfill_command_dry_run_calls_nothing(workspace):
+    from io import StringIO
+
+    from django.core.management import call_command
+
+    _account(workspace, account_platform_id="page-dry")
+    provider = _WebhookProvider()
+
+    out = StringIO()
+    with patch("apps.social_accounts.webhooks._get_provider_for_platform", return_value=provider):
+        call_command("subscribe_webhooks", "--dry-run", stdout=out)
+
+    assert provider.subscribe_calls == []
+    assert "would subscribe" in out.getvalue()
+
+
+# ------------------------------------- outcomes recorded even when not attempted
+
+
+def test_a_provider_that_cannot_be_built_is_recorded(workspace):
+    """Otherwise "Try again" re-renders an identical card and looks broken.
+
+    Returning False without touching the row left the user pressing a button
+    that produced no visible change and no error, forever.
+    """
+    account = _account(workspace)
+
+    with patch(
+        "apps.social_accounts.webhooks._get_provider_for_platform",
+        side_effect=RuntimeError("no credentials"),
+    ):
+        assert subscribe_account_webhooks(account) is False
+
+    account.refresh_from_db()
+    assert account.webhooks_active is False
+    assert account.webhook_error == WEBHOOK_UNAVAILABLE_MESSAGE
+    assert account.webhook_needs_reconnect is False
+
+
+def test_a_platform_that_lost_webhook_support_clears_its_stale_warning(workspace):
+    """A False recorded when the provider *did* subscribe must not outlive it.
+
+    Nobody can act on a warning about a platform that no longer has webhooks at
+    all, so the honest state is "not applicable".
+    """
+    from providers.bluesky import BlueskyProvider
+
+    account = _account(
+        workspace,
+        platform="bluesky",
+        webhooks_active=False,
+        webhook_error="left over from when this platform had webhooks",
+        webhook_needs_reconnect=True,
+        webhook_retry_count=3,
+    )
+
+    with patch("apps.social_accounts.webhooks._get_provider_for_platform", return_value=BlueskyProvider({})):
+        assert subscribe_account_webhooks(account) is False
+
+    account.refresh_from_db()
+    assert account.webhooks_active is None
+    assert account.webhook_error == ""
+    assert account.webhook_needs_reconnect is False
+    assert account.webhook_retry_count == 0
+
+
+def test_the_raw_provider_text_is_kept_for_operators(workspace):
+    """diagnose_facebook needs the error code the user-facing copy throws away."""
+    from providers.exceptions import APIError
+
+    account = _account(workspace)
+    raw = 'Instagram API error 400: {"error":{"message":"(#100) Param subscribed_fields[0]","fbtrace_id":"Au5i"}}'
+    provider = _WebhookProvider(error=APIError(raw, status_code=400))
+
+    with patch("apps.social_accounts.webhooks._get_provider_for_platform", return_value=provider):
+        subscribe_account_webhooks(account)
+
+    account.refresh_from_db()
+    assert "fbtrace_id" in account.webhook_error_detail
+    # ...and still never in the field the card renders.
+    assert "fbtrace_id" not in account.webhook_error
+
+
+# --------------------------------------------------- the automatic retry budget
+
+
+def test_each_failure_spends_one_retry(workspace):
+    account = _account(workspace)
+    provider = _WebhookProvider(subscribe=False)
+
+    with patch("apps.social_accounts.webhooks._get_provider_for_platform", return_value=provider):
+        subscribe_account_webhooks(account)
+        account.refresh_from_db()
+        assert account.webhook_retry_count == 1
+        subscribe_account_webhooks(account)
+
+    account.refresh_from_db()
+    assert account.webhook_retry_count == 2
+
+
+def test_a_success_refunds_the_budget(workspace):
+    account = _account(workspace, webhooks_active=False, webhook_retry_count=4)
+    provider = _WebhookProvider()
+
+    with patch("apps.social_accounts.webhooks._get_provider_for_platform", return_value=provider):
+        assert subscribe_account_webhooks(account) is True
+
+    account.refresh_from_db()
+    assert account.webhook_retry_count == 0
+
+
+def test_the_automatic_retry_stops_once_the_budget_is_spent(workspace):
+    """A permanent rejection must not be re-sent to the platform every cycle."""
+    account = _account(workspace, webhooks_active=False, webhook_retry_count=MAX_AUTOMATIC_RETRIES)
+    provider = _WebhookProvider(subscribe=False)
+
+    with patch("apps.social_accounts.webhooks._get_provider_for_platform", return_value=provider):
+        assert retry_failed_subscription(account) is False
+
+    assert provider.subscribe_calls == []
+
+
+def test_the_automatic_retry_runs_while_budget_remains(workspace):
+    account = _account(workspace, webhooks_active=False, webhook_retry_count=MAX_AUTOMATIC_RETRIES - 1)
+    provider = _WebhookProvider()
+
+    with patch("apps.social_accounts.webhooks._get_provider_for_platform", return_value=provider):
+        assert retry_failed_subscription(account) is True
+
+    assert provider.subscribe_calls == [("page-token", "page-1")]
+
+
+def test_reconnecting_refunds_the_automatic_retry_budget(workspace):
+    _account(workspace, account_platform_id="page-1", webhooks_active=False, webhook_retry_count=MAX_AUTOMATIC_RETRIES)
+
+    with patch("apps.social_accounts.views.subscribe_account_webhooks_task"):
+        account = _create_or_update_account(
+            workspace_id=workspace.id,
+            platform="facebook",
+            profile=_profile(),
+            access_token="fresh-token",
+        )
+
+    assert account.webhook_retry_count == 0
+
+
+# --------------------------------------------------------------- token scoping
+
+
+def test_a_page_must_use_its_own_token():
+    from apps.social_accounts.views import resolve_page_account_token
+
+    page = {"id": "page-1", "access_token": "PAGE-TOKEN"}
+    assert resolve_page_account_token(page, "facebook", "USER-TOKEN") == "PAGE-TOKEN"
+
+
+def test_a_page_without_its_own_token_is_not_connectable():
+    """Substituting the user token publishes under the wrong identity, and made
+    the account eligible for a revoke that severs its siblings."""
+    from apps.social_accounts.views import resolve_page_account_token
+
+    assert resolve_page_account_token({"id": "page-1"}, "facebook", "USER-TOKEN") == ""
+
+
+def test_instagram_via_facebook_may_fall_back_to_the_user_token():
+    """Its calls address the IG user, so the user token is the right credential."""
+    from apps.social_accounts.views import resolve_page_account_token
+
+    assert resolve_page_account_token({"id": "ig-1"}, "instagram", "USER-TOKEN") == "USER-TOKEN"
+
+
+def test_both_connect_flows_share_one_resolver():
+    """select_account and the connection-link flow diverging is what let a user
+    token reach a Page in the first place."""
+    import inspect
+
+    from apps.onboarding import views as onboarding_views
+    from apps.social_accounts import views as accounts_views
+
+    for module in (onboarding_views, accounts_views):
+        assert "resolve_page_account_token(" in inspect.getsource(module)
+
+
+def test_disconnect_never_revokes_the_whole_facebook_user():
+    """DELETE /me/permissions revokes the app for the entire person, so one
+    workspace disconnecting one Page would take down every other account."""
+    from unittest.mock import MagicMock as _Mock
+
+    from providers.facebook import FacebookProvider
+    from providers.instagram import InstagramProvider
+
+    for cls in (FacebookProvider, InstagramProvider):
+        provider = cls({"client_id": "id", "client_secret": "secret"})
+        provider._request = _Mock()
+
+        assert provider.revoke_token("any-token") is False
+        provider._request.assert_not_called()
+
+
+def test_only_the_page_flows_warn_that_disconnect_keeps_the_grant(workspace):
+    """Instagram Login's token belongs to the one account, so it really does
+    revoke on disconnect and must not carry the warning."""
+    for platform, expected in (
+        ("facebook", True),
+        ("instagram", True),
+        ("instagram_login", False),
+        ("bluesky", False),
+    ):
+        account = SocialAccount(workspace=workspace, platform=platform, account_platform_id="x", account_name="x")
+        assert account.keeps_platform_grant_on_disconnect is expected, platform
+
+
+# ------------------------------------------------------------- missing scopes
+
+
+def test_a_partial_grant_is_recorded_on_the_account(workspace):
+    """The whole Meta saga started with a scope silently absent from a grant."""
+    from apps.social_accounts.webhooks import record_missing_scopes
+
+    account = _account(workspace)
+    provider = MagicMock()
+    provider.required_scopes = ["pages_show_list", "pages_manage_posts", "read_insights"]
+    provider.get_granted_scopes.return_value = {"pages_show_list", "pages_manage_posts"}
+
+    with patch("apps.social_accounts.webhooks._get_provider_for_platform", return_value=provider):
+        assert record_missing_scopes(account) == ["read_insights"]
+
+    account.refresh_from_db()
+    assert account.missing_scopes == ["read_insights"]
+
+
+def test_a_complete_grant_records_nothing(workspace):
+    from apps.social_accounts.webhooks import record_missing_scopes
+
+    account = _account(workspace, missing_scopes=["read_insights"])
+    provider = MagicMock()
+    provider.required_scopes = ["pages_show_list"]
+    provider.get_granted_scopes.return_value = {"pages_show_list", "extra_scope"}
+
+    with patch("apps.social_accounts.webhooks._get_provider_for_platform", return_value=provider):
+        assert record_missing_scopes(account) == []
+
+    account.refresh_from_db()
+    # A fresh, complete grant must clear a stale warning.
+    assert account.missing_scopes == []
+
+
+def test_an_unanswerable_platform_flags_nothing_and_clears_a_stale_verdict(workspace):
+    """None means unknown. Treating it as "nothing granted" would flag every
+    scope on every platform that cannot be asked — but the task only runs after
+    a fresh grant, so a verdict about the old one no longer applies."""
+    from apps.social_accounts.webhooks import record_missing_scopes
+
+    account = _account(workspace, missing_scopes=["previously_noted"])
+    provider = MagicMock()
+    provider.required_scopes = ["pages_show_list"]
+    provider.get_granted_scopes.return_value = None
+
+    with patch("apps.social_accounts.webhooks._get_provider_for_platform", return_value=provider):
+        assert record_missing_scopes(account) == []
+
+    account.refresh_from_db()
+    assert account.missing_scopes == []
+
+
+def test_reconnecting_pinterest_clears_the_boards_write_flag(workspace):
+    """Migration 0021 flags every Pinterest account; Pinterest can't report
+    its grant, so the post-connect readback is what clears it."""
+    from apps.social_accounts.webhooks import record_missing_scopes
+    from providers.pinterest import PinterestProvider
+
+    account = _account(workspace, platform="pinterest", account_platform_id="pin-1", missing_scopes=["boards:write"])
+    provider = PinterestProvider({"client_id": "id", "client_secret": "secret"})
+
+    with patch("apps.social_accounts.webhooks._get_provider_for_platform", return_value=provider):
+        record_missing_scopes(account)
+
+    account.refresh_from_db()
+    assert account.missing_scopes == []
+
+
+def test_a_readback_failure_after_reconnect_keeps_a_real_warning(workspace):
+    """Reconnecting must not erase the warning up front: if the readback then
+    fails, the account would look healthy while still missing the scope."""
+    from apps.social_accounts.webhooks import record_missing_scopes
+
+    _account(workspace, account_platform_id="page-1", missing_scopes=["read_insights"])
+    with patch("apps.social_accounts.views.subscribe_account_webhooks_task"):
+        account = _create_or_update_account(
+            workspace_id=workspace.id,
+            platform="facebook",
+            profile=_profile(),
+            access_token="fresh-token",
+        )
+    provider = MagicMock()
+    provider.get_granted_scopes.side_effect = RuntimeError("Graph hiccup")
+
+    with patch("apps.social_accounts.webhooks._get_provider_for_platform", return_value=provider):
+        record_missing_scopes(account)
+
+    account.refresh_from_db()
+    assert account.missing_scopes == ["read_insights"]
+
+
+def test_a_readback_failure_does_not_break_the_connect_flow(workspace):
+    from apps.social_accounts.webhooks import record_missing_scopes
+
+    account = _account(workspace)
+    provider = MagicMock()
+    provider.get_granted_scopes.side_effect = RuntimeError("boom")
+
+    with patch("apps.social_accounts.webhooks._get_provider_for_platform", return_value=provider):
+        assert record_missing_scopes(account) == []
+
+
+def test_scopes_omitted_by_design_are_not_reported_missing(workspace):
+    """Connect drops the analytics-only scopes when analytics is off for the
+    platform, so comparing against the unconditional list would demand a
+    reconnect for something we deliberately never asked for."""
+    from apps.social_accounts.models import AnalyticsPlatformConfig
+    from apps.social_accounts.webhooks import record_missing_scopes
+
+    AnalyticsPlatformConfig.objects.update_or_create(platform="facebook", defaults={"is_enabled": False})
+    account = _account(workspace, platform="facebook")
+
+    from providers.facebook import FacebookProvider
+
+    provider = FacebookProvider({"client_id": "id", "client_secret": "secret"})
+    provider.get_granted_scopes = MagicMock(return_value=set(provider.required_scopes) - {"read_insights"})
+
+    with patch("apps.social_accounts.webhooks._get_provider_for_platform", return_value=provider):
+        assert record_missing_scopes(account) == []
+
+    account.refresh_from_db()
+    assert account.missing_scopes == []
+
+
+def test_a_scope_missing_while_analytics_is_on_is_still_reported(workspace):
+    from apps.social_accounts.models import AnalyticsPlatformConfig
+    from apps.social_accounts.webhooks import record_missing_scopes
+
+    AnalyticsPlatformConfig.objects.update_or_create(platform="facebook", defaults={"is_enabled": True})
+    account = _account(workspace, platform="facebook")
+
+    from providers.facebook import FacebookProvider
+
+    provider = FacebookProvider({"client_id": "id", "client_secret": "secret"})
+    provider.include_analytics_scopes = True
+    granted = set(provider.required_scopes) - {"read_insights"}
+    provider.get_granted_scopes = MagicMock(return_value=granted)
+
+    with patch("apps.social_accounts.webhooks._get_provider_for_platform", return_value=provider):
+        assert record_missing_scopes(account) == ["read_insights"]
