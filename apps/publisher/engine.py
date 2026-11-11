@@ -261,6 +261,22 @@ class _SharedMediaCache:
             tmp.close()
             try:
                 download_to_path(asset.file, tmp.name)
+            except FileNotFoundError:
+                app_url = getattr(settings, "APP_URL", "").rstrip("/")
+                raw_url = getattr(asset.file, "url", "") or ""
+                remote_url = f"{app_url}{raw_url}" if raw_url.startswith("/") and app_url else raw_url
+                if remote_url and remote_url.startswith(("http://", "https://")):
+                    import httpx
+
+                    with httpx.Client(timeout=120.0, follow_redirects=True) as http_client:
+                        resp = http_client.get(remote_url)
+                        resp.raise_for_status()
+                        with open(tmp.name, "wb") as f:
+                            f.write(resp.content)
+                else:
+                    with contextlib.suppress(OSError):
+                        os.unlink(tmp.name)
+                    raise
             except Exception:
                 with contextlib.suppress(OSError):
                     os.unlink(tmp.name)

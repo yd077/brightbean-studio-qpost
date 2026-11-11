@@ -1400,6 +1400,14 @@ def bulk_platform_action(request, workspace_id):
             else:
                 sync_post_scheduled_at(post)
 
+    if action == "publish" and count > 0:
+        try:
+            from apps.publisher.tasks import run_publish_cycle
+
+            run_publish_cycle()
+        except Exception:
+            logger.exception("Could not enqueue immediate publish cycle on bulk publish")
+
     # Plain JSON, not an HX-Trigger header: the selection bar posts with fetch(),
     # not htmx, and fires its own calendar/tab refresh events on success.
     return JsonResponse({"action": action, "count": count})

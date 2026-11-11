@@ -1273,6 +1273,14 @@ def save_post(request, workspace_id, post_id=None):
     # Save version
     _save_version(post, request.user)
 
+    if action == "publish_now":
+        try:
+            from apps.publisher.tasks import run_publish_cycle
+
+            run_publish_cycle()
+        except Exception:
+            logger.exception("Could not enqueue immediate publish cycle on publish_now")
+
     # Return appropriate response
     if request.htmx:
         return HttpResponse(
